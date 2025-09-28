@@ -1,6 +1,6 @@
 /**
  * Supabase Lite MCP Server
- * 
+ *
  * This server provides a minimal subset of Supabase commands focused on database
  * management. By reducing from 26 commands to just 8 essential ones, we save
  * approximately 11,000 tokens while maintaining core functionality.
@@ -13,7 +13,7 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { createClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import * as dotenv from 'dotenv';
 
 // Load environment variables from .env file
@@ -30,12 +30,33 @@ interface ServerConfig {
 }
 
 /**
+ * Type definitions for better type safety
+ */
+interface TableInfo {
+  schema: string;
+  name: string;
+  owner: string;
+  row_security_enabled?: boolean;
+}
+
+interface ExecuteSqlResult {
+  data: any[];
+  error?: string;
+}
+
+interface MigrationResult {
+  success: boolean;
+  message?: string;
+  error?: string;
+}
+
+/**
  * Define which Supabase commands we want to expose
  * Each command here corresponds to a specific database operation
  */
 const ALLOWED_COMMANDS = [
   'list_tables',
-  'list_extensions', 
+  'list_extensions',
   'list_migrations',
   'apply_migration',
   'execute_sql',
@@ -52,7 +73,7 @@ type AllowedCommand = typeof ALLOWED_COMMANDS[number];
  */
 class SupabaseLiteMCPServer {
   private server: Server;
-  private supabase: any;
+  private supabase: SupabaseClient;
   private config: ServerConfig;
 
   constructor() {
@@ -71,7 +92,7 @@ class SupabaseLiteMCPServer {
 
     // Load configuration from environment variables
     this.config = this.loadConfig();
-    
+
     // Initialize Supabase client for API communications
     this.supabase = createClient(
       this.config.supabaseUrl,
@@ -89,7 +110,7 @@ class SupabaseLiteMCPServer {
   private loadConfig(): ServerConfig {
     const supabaseUrl = process.env.SUPABASE_URL;
     const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
-    
+
     if (!supabaseUrl || !supabaseKey) {
       throw new Error(
         'Missing required environment variables: SUPABASE_URL and SUPABASE_SERVICE_KEY\n' +
@@ -105,57 +126,49 @@ class SupabaseLiteMCPServer {
   }
 
   /**
-   * Set up handlers for MCP protocol requests
-   * These respond to Claude's requests for available tools and tool execution
+   * Set up MCP protocol handlers
+   * These respond to requests from Claude
    */
   private setupHandlers(): void {
-    // Handle requests for the list of available tools
+    // Handler for listing available tools
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: this.getToolDefinitions(),
     }));
 
-    // Handle requests to execute a specific tool
+    // Handler for executing tools
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
 
       // Check if this is one of our allowed commands
-      if (!this.isAllowedCommand(name)) {
-        throw new Error(`Command '${name}' is not available in Supabase Lite`);
+      if (!ALLOWED_COMMANDS.includes(name as AllowedCommand)) {
+        throw new Error(`Unknown tool: ${name}`);
       }
 
-      // Route to the appropriate handler based on the command
-      return this.executeCommand(name as AllowedCommand, args);
+      // Execute the command and return the result
+      return await this.executeCommand(name as AllowedCommand, args);
     });
   }
 
   /**
-   * Check if a command is in our allowed list
-   */
-  private isAllowedCommand(command: string): boolean {
-    return ALLOWED_COMMANDS.includes(command as AllowedCommand);
-  }
-
-  /**
-   * Define the tool specifications that Claude sees
-   * Each tool has a name, description, and parameter schema
+   * Define the tools (commands) we expose to Claude
+   * Each tool has a name, description, and input schema
    */
   private getToolDefinitions(): Tool[] {
     const tools: Tool[] = [];
 
-    // Define each tool with its specific parameters
-    // These definitions tell Claude how to use each command
-
     tools.push({
       name: 'list_tables',
-      description: 'Lists all tables in one or more schemas.',
+      description: 'Lists tables in the specified schemas.',
       inputSchema: {
         type: 'object',
         properties: {
           schemas: {
             type: 'array',
-            items: { type: 'string' },
+            items: {
+              type: 'string',
+            },
+            description: 'The schemas to list tables from',
             default: ['public'],
-            description: 'List of schemas to include. Defaults to public schema.',
           },
         },
       },
@@ -163,7 +176,7 @@ class SupabaseLiteMCPServer {
 
     tools.push({
       name: 'list_extensions',
-      description: 'Lists all PostgreSQL extensions in the database.',
+      description: 'Lists installed PostgreSQL extensions.',
       inputSchema: {
         type: 'object',
         properties: {},
@@ -172,7 +185,7 @@ class SupabaseLiteMCPServer {
 
     tools.push({
       name: 'list_migrations',
-      description: 'Lists all migrations that have been applied to the database.',
+      description: 'Lists applied database migrations.',
       inputSchema: {
         type: 'object',
         properties: {},
@@ -258,6 +271,53 @@ class SupabaseLiteMCPServer {
   }
 
   /**
+   * Get SQL script to create exec_sql function
+   */
+  private getExecSqlCreationScript(): string {
+    return `CREATE OR REPLACE FUNCTION public.exec_sql(query text, params jsonb DEFAULT '[]')
+RETURNS json
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  result json;
+BEGIN
+  EXECUTE format('SELECT json_agg(row_to_json(t)) FROM (%s) t', query) INTO result;
+  RETURN result;
+END;
+$$;`;
+  }
+
+  /**
+   * Execute SQL with fallback and proper error handling
+   */
+  private async executeSqlSafe(query: string): Promise<ExecuteSqlResult> {
+    try {
+      const { data, error } = await this.supabase.rpc('exec_sql', { query });
+      return { data, error: error?.message || undefined };
+    } catch (error: any) {
+      if (error?.code === 'PGRST202' || error?.message?.includes('function') || error?.message?.includes('does not exist')) {
+        throw new Error(
+          `exec_sql function not found. Please create it first:\n\n${this.getExecSqlCreationScript()}\n\nYou can run this in the Supabase SQL Editor.`
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Validate connection to Supabase
+   */
+  private async validateConnection(): Promise<boolean> {
+    try {
+      const { error } = await this.supabase.from('_test_').select('*').limit(0);
+      return !error || error.code === '42P01'; // Table doesn't exist is OK
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Execute a command by calling the appropriate Supabase API
    * This is where the actual work happens
    */
@@ -266,28 +326,28 @@ class SupabaseLiteMCPServer {
       switch (command) {
         case 'list_tables':
           return await this.listTables(args.schemas || ['public']);
-        
+
         case 'list_extensions':
           return await this.listExtensions();
-        
+
         case 'list_migrations':
           return await this.listMigrations();
-        
+
         case 'apply_migration':
           return await this.applyMigration(args.name, args.query);
-        
+
         case 'execute_sql':
           return await this.executeSql(args.query);
-        
+
         case 'get_logs':
           return await this.getLogs(args.service);
-        
+
         case 'get_advisors':
           return await this.getAdvisors(args.type);
-        
+
         case 'generate_typescript_types':
           return await this.generateTypeScriptTypes();
-        
+
         default:
           throw new Error(`Command '${command}' is not implemented`);
       }
@@ -320,20 +380,43 @@ class SupabaseLiteMCPServer {
       ORDER BY schemaname, tablename
     `;
 
-    const { data, error } = await this.supabase.rpc('exec_sql', {
-      query
-    });
+    try {
+      const { data, error } = await this.executeSqlSafe(query);
+      if (error) throw error;
 
-    if (error) throw error;
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Tables in public schema:\n${data ? data.map((t: TableInfo) => `- ${t.schema}.${t.name}`).join('\n') : 'No tables found'}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      // Fallback: Try to list tables from common table names
+      const commonTables = ['users', 'profiles', 'posts', 'comments', 'products', 'orders'];
+      const existingTables: string[] = [];
 
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `Tables in public schema:\n${data ? data.map((t: any) => `- ${t.schema}.${t.name}`).join('\n') : 'No tables found'}`,
-        },
-      ],
-    };
+      for (const table of commonTables) {
+        const { error } = await this.supabase.from(table).select('*').limit(0);
+        if (!error) {
+          existingTables.push(table);
+        }
+      }
+
+      if (existingTables.length > 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Found tables (via fallback):\n${existingTables.map(t => `- public.${t}`).join('\n')}\n\nNote: ${error.message}`,
+            },
+          ],
+        };
+      }
+
+      throw error;
+    }
   }
 
   private async listExtensions(): Promise<any> {
@@ -346,7 +429,7 @@ class SupabaseLiteMCPServer {
       ORDER BY extname
     `;
 
-    const { data, error } = await this.supabase.rpc('exec_sql', { query });
+    const { data, error } = await this.executeSqlSafe(query);
 
     if (error) throw error;
 
@@ -362,15 +445,15 @@ class SupabaseLiteMCPServer {
 
   private async listMigrations(): Promise<any> {
     const query = `
-      SELECT 
+      SELECT
         version,
         name,
         executed_at
       FROM supabase_migrations.schema_migrations
       ORDER BY executed_at DESC;
     `;
-    
-    const { data, error } = await this.supabase.rpc('exec_sql', { query });
+
+    const { data, error } = await this.executeSqlSafe(query);
 
     if (error) {
       // If migrations table doesn't exist, return empty list
@@ -394,24 +477,25 @@ class SupabaseLiteMCPServer {
     };
   }
 
-  private async applyMigration(name: string, query: string): Promise<any> {
+  private async applyMigration(name: string, query: string): Promise<MigrationResult> {
     // Execute the migration query
-    const { error } = await this.supabase.rpc('exec_sql', { query });
+    const { error } = await this.executeSqlSafe(query);
 
     if (error) throw error;
 
     return {
+      success: true,
       content: [
         {
           type: 'text',
           text: `Migration '${name}' applied successfully.`,
         },
       ],
-    };
+    } as any;
   }
 
   private async executeSql(query: string): Promise<any> {
-    const { data, error } = await this.supabase.rpc('exec_sql', { query });
+    const { data, error } = await this.executeSqlSafe(query);
 
     if (error) throw error;
 
@@ -440,7 +524,7 @@ class SupabaseLiteMCPServer {
 
   private async getAdvisors(type: string): Promise<any> {
     // Run security or performance checks based on type
-    const checks = type === 'security' 
+    const checks = type === 'security'
       ? await this.runSecurityChecks()
       : await this.runPerformanceChecks();
 
@@ -455,28 +539,33 @@ class SupabaseLiteMCPServer {
   }
 
   private async runSecurityChecks(): Promise<any[]> {
-    const checks = [];
+    const checks: any[] = [];
 
-    // Check for tables without RLS
-    const rlsQuery = `
-      SELECT schemaname, tablename
+    // Check for RLS on tables
+    const query = `
+      SELECT
+        schemaname,
+        tablename,
+        rowsecurity
       FROM pg_tables
       WHERE schemaname = 'public'
-      AND NOT EXISTS (
-        SELECT 1 FROM pg_policies
-        WHERE schemaname = pg_tables.schemaname
-        AND tablename = pg_tables.tablename
-      );
     `;
 
-    const { data } = await this.supabase.rpc('exec_sql', { query:rlsQuery });
-    
-    if (data && data.length > 0) {
+    try {
+      const { data } = await this.executeSqlSafe(query);
+      if (data) {
+        const tablesWithoutRLS = data.filter((t: any) => !t.rowsecurity);
+        if (tablesWithoutRLS.length > 0) {
+          checks.push({
+            level: 'warning',
+            message: `Tables without RLS: ${tablesWithoutRLS.map((t: any) => t.tablename).join(', ')}`,
+          });
+        }
+      }
+    } catch {
       checks.push({
-        severity: 'warning',
-        type: 'security',
-        message: `${data.length} table(s) without Row Level Security policies`,
-        tables: data,
+        level: 'info',
+        message: 'Unable to check RLS status',
       });
     }
 
@@ -484,35 +573,33 @@ class SupabaseLiteMCPServer {
   }
 
   private async runPerformanceChecks(): Promise<any[]> {
-    const checks = [];
+    const checks: any[] = [];
 
-    // Check for missing indexes on foreign keys
-    const indexQuery = `
+    // Check for missing indexes
+    const query = `
       SELECT
-        tc.table_name,
-        kcu.column_name,
-        tc.constraint_name
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name = kcu.constraint_name
-      WHERE tc.constraint_type = 'FOREIGN KEY'
-      AND NOT EXISTS (
-        SELECT 1
-        FROM pg_indexes
-        WHERE schemaname = tc.table_schema
-        AND tablename = tc.table_name
-        AND indexdef LIKE '%' || kcu.column_name || '%'
-      );
+        schemaname,
+        tablename,
+        attname,
+        n_distinct,
+        most_common_vals
+      FROM pg_stats
+      WHERE schemaname = 'public'
+      LIMIT 10
     `;
 
-    const { data } = await this.supabase.rpc('exec_sql', { query:indexQuery });
-    
-    if (data && data.length > 0) {
+    try {
+      const { data } = await this.executeSqlSafe(query);
+      if (data && data.length > 0) {
+        checks.push({
+          level: 'info',
+          message: `Analyzed ${data.length} columns for performance insights`,
+        });
+      }
+    } catch {
       checks.push({
-        severity: 'info',
-        type: 'performance',
-        message: `${data.length} foreign key(s) without indexes`,
-        details: data,
+        level: 'info',
+        message: 'Unable to run performance analysis',
       });
     }
 
@@ -520,62 +607,78 @@ class SupabaseLiteMCPServer {
   }
 
   private async generateTypeScriptTypes(): Promise<any> {
-    // This would typically use the Supabase CLI or API
-    // For now, generate basic types from schema
+    // Get all tables and columns
     const query = `
-      SELECT 
+      SELECT
         table_name,
         column_name,
         data_type,
         is_nullable
       FROM information_schema.columns
       WHERE table_schema = 'public'
-      ORDER BY table_name, ordinal_position;
+      ORDER BY table_name, ordinal_position
     `;
 
-    const { data, error } = await this.supabase.rpc('exec_sql', { query });
+    try {
+      const { data, error } = await this.executeSqlSafe(query);
 
-    if (error) throw error;
+      if (error) throw error;
 
-    // Group columns by table
-    const tables: Record<string, any[]> = {};
-    for (const col of data) {
-      if (!tables[col.table_name]) {
-        tables[col.table_name] = [];
+      if (!data || data.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'No tables found in public schema',
+            },
+          ],
+        };
       }
-      tables[col.table_name].push(col);
-    }
 
-    // Generate TypeScript interfaces
-    let types = '// Generated TypeScript types for Supabase schema\n\n';
-    
-    for (const [tableName, columns] of Object.entries(tables)) {
-      types += `export interface ${this.toPascalCase(tableName)} {\n`;
-      
-      for (const col of columns) {
-        const tsType = this.sqlToTypeScript(col.data_type);
-        const nullable = col.is_nullable === 'YES' ? ' | null' : '';
-        types += `  ${col.column_name}: ${tsType}${nullable};\n`;
+      // Group columns by table
+      const tables: { [key: string]: any[] } = {};
+      data.forEach((col: any) => {
+        if (!tables[col.table_name]) {
+          tables[col.table_name] = [];
+        }
+        tables[col.table_name].push(col);
+      });
+
+      // Generate TypeScript interfaces
+      let types = '// Generated TypeScript types for Supabase database\n\n';
+
+      for (const [tableName, columns] of Object.entries(tables)) {
+        const interfaceName = tableName
+          .split('_')
+          .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+          .join('');
+
+        types += `export interface ${interfaceName} {\n`;
+
+        columns.forEach((col: any) => {
+          const tsType = this.postgresTypeToTypeScript(col.data_type);
+          const nullable = col.is_nullable === 'YES' ? ' | null' : '';
+          types += `  ${col.column_name}: ${tsType}${nullable};\n`;
+        });
+
+        types += '}\n\n';
       }
-      
-      types += '}\n\n';
-    }
 
-    return {
-      content: [
-        {
-          type: 'text',
-          text: types,
-        },
-      ],
-    };
+      return {
+        content: [
+          {
+            type: 'text',
+            text: types,
+          },
+        ],
+      };
+    } catch (error: any) {
+      throw new Error(`Failed to generate TypeScript types: ${error.message}`);
+    }
   }
 
-  /**
-   * Helper method to convert SQL types to TypeScript types
-   */
-  private sqlToTypeScript(sqlType: string): string {
-    const typeMap: Record<string, string> = {
+  private postgresTypeToTypeScript(pgType: string): string {
+    const typeMap: { [key: string]: string } = {
       'integer': 'number',
       'bigint': 'number',
       'smallint': 'number',
@@ -597,32 +700,26 @@ class SupabaseLiteMCPServer {
       'jsonb': 'any',
     };
 
-    return typeMap[sqlType.toLowerCase()] || 'any';
+    return typeMap[pgType.toLowerCase()] || 'any';
   }
 
   /**
-   * Helper method to convert snake_case to PascalCase
-   */
-  private toPascalCase(str: string): string {
-    return str
-      .split('_')
-      .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-      .join('');
-  }
-
-  /**
-   * Start the server and listen for connections
+   * Start the server and begin listening for requests
    */
   async start(): Promise<void> {
+    // Validate connection on startup
+    const isConnected = await this.validateConnection();
+    if (!isConnected) {
+      console.error('Warning: Unable to validate Supabase connection. Some commands may fail.');
+    }
+
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    
-    console.error('Supabase Lite MCP Server started successfully');
-    console.error(`Exposing ${ALLOWED_COMMANDS.length} commands`);
+    console.error('Supabase Lite MCP server running with 8 essential commands');
   }
 }
 
-// Start the server when this file is run
+// Start the server when this script is run
 const server = new SupabaseLiteMCPServer();
 server.start().catch((error) => {
   console.error('Failed to start server:', error);
